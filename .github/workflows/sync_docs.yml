@@ -1,93 +1,93 @@
-name: Sync Documentation to Search Index
+name: Send Custom Webhook on Push
 
 on:
   push:
     branches: [main]
-    paths:
-      - '**/*.mdx'
-      - '**/*.txt'
 
 jobs:
-  sync-docs:
+  send_webhook:
     runs-on: ubuntu-latest
 
     steps:
-      # 1 – Check out the code
-      - name: Check out repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # full history → better diff detection
+    # 1 ─ Checkout full history so the diff action can compare commits
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
-      # 2 – Work out exactly which docs changed
-      - name: Get changed files
-        id: changed
-        uses: tj-actions/changed-files@v46.0.5
-        with:
-          files: |
-            **/*.mdx
-            **/*.txt
-          json: true       # gives us *_files_json outputs
+    # 2 ─ Detect changed files (JSON arrays ⇢ no parsing headaches)
+    - name: Get changed files
+      id: diff
+      uses: tj-actions/changed-files@ed68ef82c095e0d48ec87eccea555d944a631a4c # v46, pre-attack commit
+      with:
+        files: |
+          **/*.mdx
+          **/*.txt
+        json: true          # turn list outputs into JSON
+        escape_json: false  # keep them un-escaped so jq can read them
 
-      # 3 – (Optional) Print the diff for troubleshooting
-      - name: Show diff
-        if: steps.changed.outputs.any_changed == 'true'
-        run: |
-          echo "Modified files:" ; echo '${{ steps.changed.outputs.modified_files_json }}' | jq .
-          echo "Added files:"    ; echo '${{ steps.changed.outputs.added_files_json }}'    | jq .
-          echo "Deleted files:"  ; echo '${{ steps.changed.outputs.deleted_files_json }}'  | jq .
+    # 3 ─ Quick debug print (optional)
+    - name: Show diff
+      run: |
+        echo "Added   :"    ; echo '${{ steps.diff.outputs.added_files   }}' | jq .
+        echo "Modified:"    ; echo '${{ steps.diff.outputs.modified_files}}' | jq .
+        echo "Deleted :"    ; echo '${{ steps.diff.outputs.deleted_files }}' | jq .
 
-      # 4 – Send a signed webhook with a single “diff” commit
-      - name: Push diff to search index
-        if: steps.changed.outputs.any_changed == 'true'
-        env:
-          WEBHOOK_URL:    ${{ secrets.WEBHOOK_URL }}
-          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
-        run: |
-          # Build JSON payload
-          payload=$(jq -n \
-            --argjson added    '${{ steps.changed.outputs.added_files_json }}' \
-            --argjson modified '${{ steps.changed.outputs.modified_files_json }}' \
-            --argjson removed  '${{ steps.changed.outputs.deleted_files_json }}' \
-            --arg repo_name    "${{ github.event.repository.name }}" \
-            --arg repo_full    "${{ github.repository }}" \
-            --arg owner        "${{ github.repository_owner }}" \
-            '{
-              commits: [{
-                added:    $added,
-                removed:  $removed,
-                modified: $modified
-              }],
-              repository: {
-                name:      $repo_name,
-                full_name: $repo_full,
-                owner: { name: $owner }
-              }
-            }')
+    # 4 ─ Build a GitHub-style payload and send the webhook
+    - name: Prepare & send webhook
+      if: |
+        steps.diff.outputs.added_files    != '[]' ||
+        steps.diff.outputs.modified_files != '[]' ||
+        steps.diff.outputs.deleted_files  != '[]'
+      env:
+        WEBHOOK_URL:    ${{ secrets.WEBHOOK_URL }}
+        WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        ADDED_JSON:     ${{ steps.diff.outputs.added_files }}
+        MOD_JSON:       ${{ steps.diff.outputs.modified_files }}
+        DEL_JSON:       ${{ steps.diff.outputs.deleted_files }}
+      run: |
+        # Fall back to [] if any output is blank
+        added=${ADDED_JSON:-'[]'}
+        mod=${MOD_JSON:-'[]'}
+        del=${DEL_JSON:-'[]'}
 
-          # Sign with HMAC-SHA256
-          sig=$(printf '%s' "$payload" | \
-                openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | xxd -p -c 256)
+        # Build the payload
+        payload=$(jq -n \
+          --argjson added "$added" \
+          --argjson modified "$mod" \
+          --argjson removed "$del" \
+          --arg repo_name "${{ github.event.repository.name }}" \
+          --arg repo_full "${{ github.repository }}" \
+          --arg owner     "${{ github.repository_owner }}" \
+          '{
+             commits: [{
+               added:    $added,
+               removed:  $removed,
+               modified: $modified
+             }],
+             repository: {
+               name:      $repo_name,
+               full_name: $repo_full,
+               owner: { name: $owner }
+             }
+           }')
 
-          # POST (retry 3× for resilience)
-          for attempt in 1 2 3 ; do
-            echo "Attempt $attempt"
-            resp=$(curl -sS -X POST "$WEBHOOK_URL" \
-              -H "Content-Type: application/json" \
-              -H "X-Hub-Signature-256: sha256=$sig" \
-              -H "X-GitHub-Event: push" \
-              --data "$payload" \
-              -w '\n%{http_code}')
+        # Sign with HMAC-SHA256
+        sig=$(printf '%s' "$payload" | \
+              openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | xxd -p -c 256)
 
-            code=$(echo "$resp" | tail -n1)
-            body=$(echo "$resp" | sed '$d')
-            echo "HTTP $code" ; echo "$body"
-
-            if [[ "$code" =~ ^20[0-9]$ ]]; then
-              echo "✅ Webhook sent successfully"
-              exit 0
-            fi
-
-            [[ $attempt -lt 3 ]] && echo "Retrying…" && sleep 5
-          done
-
-          echo "❌ All retries failed" && exit 1
+        # POST (3-try back-off loop)
+        for i in 1 2 3; do
+          echo "Attempt $i"
+          resp=$(curl -sS -X POST "$WEBHOOK_URL" \
+                   -H "Content-Type: application/json" \
+                   -H "X-Hub-Signature-256: sha256=$sig" \
+                   -H "X-GitHub-Event: push" \
+                   --data "$payload" -w '\n%{http_code}')
+          code=$(echo "$resp" | tail -n1)
+          body=$(echo "$resp" | sed '$d')
+          echo "HTTP $code"
+          [ "$body" ] && echo "$body"
+          [[ "$code" =~ ^20[0-9]$ ]] && { echo "✅ Webhook sent"; exit 0; }
+          [[ $i -lt 3 ]] && sleep 5
+        done
+        echo "❌ Webhook failed after 3 tries" && exit 1
