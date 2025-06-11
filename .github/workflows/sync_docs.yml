@@ -2,97 +2,92 @@ name: Sync Documentation to Search Index
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
     paths:
-      - '**.mdx'
-      - '**.txt'
+      - '**/*.mdx'
+      - '**/*.txt'
 
 jobs:
   sync-docs:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout code
+      # 1 – Check out the code
+      - name: Check out repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0   # full history → better diff detection
 
+      # 2 – Work out exactly which docs changed
       - name: Get changed files
-        id: changed-files
+        id: changed
         uses: tj-actions/changed-files@v46.0.5
         with:
           files: |
             **/*.mdx
             **/*.txt
-          json: true
+          json: true       # gives us *_files_json outputs
 
-      - name: Display changed files
-        if: steps.changed-files.outputs.any_changed == 'true'
+      # 3 – (Optional) Print the diff for troubleshooting
+      - name: Show diff
+        if: steps.changed.outputs.any_changed == 'true'
         run: |
-          echo "Modified files:"
-          echo '${{ steps.changed-files.outputs.modified_files }}' | jq '.'
-          echo "Added files:"
-          echo '${{ steps.changed-files.outputs.added_files }}' | jq '.'
-          echo "Deleted files:"
-          echo '${{ steps.changed-files.outputs.deleted_files }}' | jq '.'
+          echo "Modified files:" ; echo '${{ steps.changed.outputs.modified_files_json }}' | jq .
+          echo "Added files:"    ; echo '${{ steps.changed.outputs.added_files_json }}'    | jq .
+          echo "Deleted files:"  ; echo '${{ steps.changed.outputs.deleted_files_json }}'  | jq .
 
-      - name: Send webhook
-        if: steps.changed-files.outputs.any_changed == 'true'
+      # 4 – Send a signed webhook with a single “diff” commit
+      - name: Push diff to search index
+        if: steps.changed.outputs.any_changed == 'true'
         env:
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_URL:    ${{ secrets.WEBHOOK_URL }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
         run: |
-          # Build payload with single commit containing net changes
+          # Build JSON payload
           payload=$(jq -n \
-            --argjson added '${{ steps.changed-files.outputs.added_files }}' \
-            --argjson modified '${{ steps.changed-files.outputs.modified_files }}' \
-            --argjson removed '${{ steps.changed-files.outputs.deleted_files }}' \
+            --argjson added    '${{ steps.changed.outputs.added_files_json }}' \
+            --argjson modified '${{ steps.changed.outputs.modified_files_json }}' \
+            --argjson removed  '${{ steps.changed.outputs.deleted_files_json }}' \
+            --arg repo_name    "${{ github.event.repository.name }}" \
+            --arg repo_full    "${{ github.repository }}" \
+            --arg owner        "${{ github.repository_owner }}" \
             '{
               commits: [{
-                added: $added,
-                removed: $removed,
+                added:    $added,
+                removed:  $removed,
                 modified: $modified
               }],
               repository: {
-                name: "${{ github.event.repository.name }}",
-                full_name: "${{ github.repository }}",
-                owner: {
-                  name: "${{ github.repository_owner }}"
-                }
+                name:      $repo_name,
+                full_name: $repo_full,
+                owner: { name: $owner }
               }
             }')
-          
-          # Generate signature (same as your current method)
-          signature=$(echo -n "$payload" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | xxd -p -c 256)
-          
-          # Send webhook with retries
-          for attempt in 1 2 3; do
-            echo "Attempt $attempt..."
-            
-            response=$(curl -X POST "$WEBHOOK_URL" \
+
+          # Sign with HMAC-SHA256
+          sig=$(printf '%s' "$payload" | \
+                openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | xxd -p -c 256)
+
+          # POST (retry 3× for resilience)
+          for attempt in 1 2 3 ; do
+            echo "Attempt $attempt"
+            resp=$(curl -sS -X POST "$WEBHOOK_URL" \
               -H "Content-Type: application/json" \
-              -H "X-Hub-Signature-256: sha256=$signature" \
+              -H "X-Hub-Signature-256: sha256=$sig" \
               -H "X-GitHub-Event: push" \
-              -d "$payload" \
-              -w "\n%{http_code}" \
-              -s \
-              --connect-timeout 30 \
-              --max-time 60)
-            
-            http_status=$(echo "$response" | tail -n1)
-            response_body=$(echo "$response" | sed '$d')
-            
-            echo "HTTP Status: $http_status"
-            echo "Response body: $response_body"
-            
-            if [ "$http_status" -eq 200 ] || [ "$http_status" -eq 201 ] || [ "$http_status" -eq 202 ]; then
+              --data "$payload" \
+              -w '\n%{http_code}')
+
+            code=$(echo "$resp" | tail -n1)
+            body=$(echo "$resp" | sed '$d')
+            echo "HTTP $code" ; echo "$body"
+
+            if [[ "$code" =~ ^20[0-9]$ ]]; then
               echo "✅ Webhook sent successfully"
               exit 0
-            elif [ "$attempt" -lt 3 ]; then
-              echo "Retrying in 5 seconds..."
-              sleep 5
             fi
+
+            [[ $attempt -lt 3 ]] && echo "Retrying…" && sleep 5
           done
-          
-          echo "❌ Failed to send webhook after 3 attempts"
-          exit 1
+
+          echo "❌ All retries failed" && exit 1
