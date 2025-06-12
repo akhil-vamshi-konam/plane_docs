@@ -1,4 +1,4 @@
-name: Send Custom Webhook on Push
+name: Send Commit-Based Webhook on Push
 
 on:
   push:
@@ -9,73 +9,76 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    # 1 ─ Checkout full history so the diff action can compare commits
+    # 1 ─ Checkout repository
     - uses: actions/checkout@v4
       with:
-        fetch-depth: 0
+        fetch-depth: 2  # We need at least 2 commits to get the previous one
 
-    # 2 ─ Detect changed files (JSON arrays ⇢ no parsing headaches)
-    - name: Get changed files
-      id: diff
-      uses: tj-actions/changed-files@v46.0.5
-      with:
-        files: |
-          **/*.mdx
-          **/*.txt
-        json: true          # turn list outputs into JSON
-        escape_json: false  # keep them un-escaped so jq can read them
-
-    # 3 ─ Quick debug print (optional)
-    - name: Show diff
+    # 2 ─ Get current and previous commit IDs
+    - name: Get commit information
+      id: commits
       run: |
-        echo "Added   :"    ; echo '${{ steps.diff.outputs.added_files   }}' | jq .
-        echo "Modified:"    ; echo '${{ steps.diff.outputs.modified_files}}' | jq .
-        echo "Deleted :"    ; echo '${{ steps.diff.outputs.deleted_files }}' | jq .
+        CURRENT_COMMIT="${{ github.sha }}"
+        PREVIOUS_COMMIT=$(git rev-parse HEAD~1)
+        REPO_NAME="${{ github.event.repository.name }}"
+        
+        echo "current_commit=$CURRENT_COMMIT" >> $GITHUB_OUTPUT
+        echo "previous_commit=$PREVIOUS_COMMIT" >> $GITHUB_OUTPUT
+        echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+        
+        echo "Current commit: $CURRENT_COMMIT"
+        echo "Previous commit: $PREVIOUS_COMMIT"
+        echo "Repository: $REPO_NAME"
 
-    # 4 ─ Build a GitHub-style payload and send the webhook
-    - name: Prepare & send webhook
-      if: |
-        steps.diff.outputs.added_files    != '[]' ||
-        steps.diff.outputs.modified_files != '[]' ||
-        steps.diff.outputs.deleted_files  != '[]'
+    # 3 ─ Check if there are any documentation files changed
+    - name: Check for doc changes
+      id: check_changes
+      run: |
+        # Check if any .mdx or .txt files have changed
+        if git diff --name-only ${{ steps.commits.outputs.previous_commit }}..${{ steps.commits.outputs.current_commit }} | grep -E '\.(mdx|txt)$'; then
+          echo "has_doc_changes=true" >> $GITHUB_OUTPUT
+          echo "Documentation files have changed"
+        else
+          echo "has_doc_changes=false" >> $GITHUB_OUTPUT
+          echo "No documentation files changed"
+        fi
+
+    # 4 ─ Build payload and send webhook (only if there are doc changes)
+    - name: Send webhook
+      if: steps.check_changes.outputs.has_doc_changes == 'true'
       env:
-        WEBHOOK_URL:    ${{ secrets.WEBHOOK_URL }}
+        WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
-        ADDED_JSON:     ${{ steps.diff.outputs.added_files }}
-        MOD_JSON:       ${{ steps.diff.outputs.modified_files }}
-        DEL_JSON:       ${{ steps.diff.outputs.deleted_files }}
+        CURRENT_COMMIT: ${{ steps.commits.outputs.current_commit }}
+        PREVIOUS_COMMIT: ${{ steps.commits.outputs.previous_commit }}
+        REPO_NAME: ${{ steps.commits.outputs.repo_name }}
       run: |
-        # Fall back to [] if any output is blank
-        added=${ADDED_JSON:-'[]'}
-        mod=${MOD_JSON:-'[]'}
-        del=${DEL_JSON:-'[]'}
-
-        # Build the payload
+        # Build the simplified payload with commit information
         payload=$(jq -n \
-          --argjson added "$added" \
-          --argjson modified "$mod" \
-          --argjson removed "$del" \
-          --arg repo_name "${{ github.event.repository.name }}" \
+          --arg current_commit_id "$CURRENT_COMMIT" \
+          --arg previous_commit_id "$PREVIOUS_COMMIT" \
+          --arg repo_name "$REPO_NAME" \
           --arg repo_full "${{ github.repository }}" \
-          --arg owner     "${{ github.repository_owner }}" \
+          --arg owner "${{ github.repository_owner }}" \
           '{
-             commits: [{
-               added:    $added,
-               removed:  $removed,
-               modified: $modified
-             }],
+             current_commit_id: $current_commit_id,
+             previous_commit_id: $previous_commit_id,
+             repo_name: $repo_name,
              repository: {
-               name:      $repo_name,
+               name: $repo_name,
                full_name: $repo_full,
                owner: { name: $owner }
              }
            }')
 
+        echo "Sending payload:"
+        echo "$payload" | jq .
+
         # Sign with HMAC-SHA256
         sig=$(printf '%s' "$payload" | \
               openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | xxd -p -c 256)
 
-        # POST (3-try back-off loop)
+        # POST with retry logic (3 attempts with exponential backoff)
         for i in 1 2 3; do
           echo "Attempt $i"
           resp=$(curl -sS -X POST "$WEBHOOK_URL" \
@@ -87,7 +90,25 @@ jobs:
           body=$(echo "$resp" | sed '$d')
           echo "HTTP $code"
           [ "$body" ] && echo "$body"
-          [[ "$code" =~ ^20[0-9]$ ]] && { echo "✅ Webhook sent"; exit 0; }
-          [[ $i -lt 3 ]] && sleep 5
+          
+          if [[ "$code" =~ ^20[0-9]$ ]]; then
+            echo "✅ Webhook sent successfully"
+            exit 0
+          fi
+          
+          if [[ $i -lt 3 ]]; then
+            wait_time=$((i * i * 5))  # Exponential backoff: 5s, 20s
+            echo "⏳ Waiting ${wait_time}s before retry..."
+            sleep $wait_time
+          fi
         done
-        echo "❌ Webhook failed after 3 tries" && exit 1
+        
+        echo "❌ Webhook failed after 3 attempts"
+        exit 1
+
+    # 5 ─ Log when no changes detected
+    - name: No changes detected
+      if: steps.check_changes.outputs.has_doc_changes == 'false'
+      run: |
+        echo "ℹ️ No documentation files (.mdx, .txt) were changed in this push"
+        echo "Skipping webhook notification" 
