@@ -48,6 +48,11 @@ jobs:
           local SECRET=$2
           local LABEL=$3
 
+          if [[ -z "$URL" || -z "$SECRET" ]]; then
+            echo "Skipping $LABEL: Missing WEBHOOK_URL or WEBHOOK_SECRET"
+            return
+          fi
+
           payload=$(jq -n \
             --arg current_commit_id "$CURRENT_COMMIT" \
             --arg previous_commit_id "$PREVIOUS_COMMIT" \
@@ -92,8 +97,8 @@ jobs:
           done
         }
 
-        send_webhook "$WEBHOOK_URL" "$WEBHOOK_SECRET" "Production"
         send_webhook "$WEBHOOK_URL_DEV" "$WEBHOOK_SECRET_DEV" "Development"
+        send_webhook "$WEBHOOK_URL" "$WEBHOOK_SECRET" "Production"
 
     - name: No changes detected
       if: steps.check_changes.outputs.has_doc_changes == 'false'
