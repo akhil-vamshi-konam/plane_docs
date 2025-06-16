@@ -1,73 +1,37 @@
-name: Send Commit-Based Webhook on Push
+name: Docs to Vector
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+  push:
+    branches:
+      - master
 
 jobs:
-  send_webhook:
+  build:
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 2
-
-    - name: Get commit information
-      id: commits
-      run: |
-        echo "current_commit=${{ github.sha }}" >> "$GITHUB_OUTPUT"
-        echo "repo_name=${{ github.event.repository.name }}" >> "$GITHUB_OUTPUT"
-
-    - name: Send webhook
-      env:
-        CURRENT_COMMIT: ${{ steps.commits.outputs.current_commit }}
-        REPO_NAME: ${{ steps.commits.outputs.repo_name }}
-        REPO_FULL: ${{ github.repository }}
-        OWNER: ${{ github.repository_owner }}
-        WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-        WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
-      run: |
-        set -euo pipefail
-
-        payload=$(jq -n \
-          --arg current_commit_id "$CURRENT_COMMIT" \
-          --arg repo_name "$REPO_NAME" \
-          --arg repo_full "$REPO_FULL" \
-          --arg owner "$OWNER" \
-          '{
-            current_commit_id: $current_commit_id,
-            repo_name: $repo_name,
-            repository: {
-              name: $repo_name,
-              full_name: $repo_full,
-              owner: { name: $owner }
-            }
-          }')
-
-        sig=$(printf '%s' "$payload" | \
-              openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | xxd -p -c 256)
-
-        for i in 1 2 3; do
-          echo "Sending webhook - Attempt $i"
-          resp=$(curl -sS -X POST "$WEBHOOK_URL" \
-                   -H "Content-Type: application/json" \
-                   -H "X-Hub-Signature-256: sha256=$sig" \
-                   -H "X-GitHub-Event: push" \
-                   --data "$payload" -w '\n%{http_code}')
-          code=$(echo "$resp" | tail -n1)
-          body=$(echo "$resp" | sed '$d')
-
-          if [[ "$code" =~ ^20[0-9]$ ]]; then
-            echo "Webhook sent successfully"
-            break
-          fi
-
-          if [[ $i -lt 3 ]]; then
-            sleep $((i * i * 5))
-          else
-            echo "Webhook failed after 3 attempts"
-            echo "$body"
-          fi
-        done
+      - name: Prepare Payload
+        id: payload
+        run: |
+          payload=$(jq -n \
+            --arg current_commit_id "${{ github.sha }}" \
+            --arg branch_name "${{ github.ref_name }}" \
+            --arg repo_name "${{ github.event.repository.name }}" \
+            '{
+              current_commit_id: $current_commit_id,
+              branch_name: $branch_name,
+              repo_name: $repo_name,
+            }')
+          echo "$payload" > /tmp/payload.json
+          
+      - name: Call Webhook (Preview)
+        run: |
+          payload=$(cat /tmp/payload.json)
+          sig=$(printf '%s' "$payload" | \
+              openssl dgst -sha256 -hmac "${{ secrets.WEBHOOK_SECRET }}" -binary | xxd -p -c 256)
+          
+          curl -X POST \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: sha256=$sig" \
+            -d "$payload" \
+            ${{ secrets.WEBHOOK_URL }}
